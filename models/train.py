@@ -377,9 +377,9 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
 
     for epoch in range(start_epoch + 1, cfg.stage2_epochs + 1):
         model.train()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=device)
         n_batches = 0
-        pd_sum = torch.zeros(cfg.input_dim) # accumulate per-dim recovery MSE
+        pd_sum = torch.zeros(cfg.input_dim, device=device)
         for batch in train_loader:
             domain_str = _batch_domain_str(batch)
             mode = sample_mode(domain_str, rng)
@@ -411,11 +411,11 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += loss.detach()
             n_batches += 1
             step += 1
             if 'loss_per_dim' in out:
-                pd_sum += out['loss_per_dim'].detach().cpu()
+                pd_sum += out['loss_per_dim'].detach()
             if step % cfg.log_every == 0:
                 sp, tp, kn = _group_per_dim(out.get('loss_per_dim', torch.zeros(cfg.input_dim)))
                 logger.info('\tStage 2: step=%d | loss=%.6f | rec=%.6f | ctr=%.6f | lb=%.6f '
@@ -458,7 +458,7 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
         tr_sp, tr_tp, tr_kn = _group_per_dim(pd_sum / max(n_batches, 1))
         va_sp, va_tp, va_kn = _group_per_dim(val_pd_sum / max(n_val, 1))
         logger.info('Stage 2: epoch %3d/%d | train=%.6f | val_rec=%.6f | val_spatial=%.6f', epoch,
-                    cfg.stage2_epochs, total_loss / max(n_batches, 1), val_loss, va_sp)
+                    cfg.stage2_epochs, total_loss.item() / max(n_batches, 1), val_loss, va_sp)
         logger.info('\ttrain rec[spatial=%.6f temporal=%.6f kin=%.6f] | '
                     'val rec[spatial=%.6f temporal=%.6f kin=%.6f]',
                     tr_sp, tr_tp, tr_kn, va_sp, va_tp, va_kn)

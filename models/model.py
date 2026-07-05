@@ -185,9 +185,8 @@ class SparseCrossDomainMoE(nn.Module):
         out = torch.zeros_like(flat_x)
         for c, expert in enumerate(self.experts):
             sel = (topk_idx == c).any(dim=-1)
-            if sel.any():
-                contrib = expert(flat_x[sel]) * sparse_gates[sel, c].unsqueeze(-1)
-                out[sel] += contrib
+            contrib = expert(flat_x[sel]) * sparse_gates[sel, c].unsqueeze(-1)
+            out[sel] += contrib
         out = out.view(B, L, d)
 
         # Balancing loss over valid tokens
