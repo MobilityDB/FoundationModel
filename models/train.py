@@ -47,6 +47,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ========== Reproducibility ==========
+
+_RNG = np.random.default_rng()   # module-level RNG for masking; reseeded by set_seed()
+
+def set_seed(seed: int) -> None:
+    """Seed every RNG so a given --seed reproduces identical training data across runs"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    global _RNG
+    _RNG = np.random.default_rng(seed)
+    logger.info('Seeded all RNGs with seed=%d', seed)
+
+def _worker_init_fn(worker_id: int) -> None:
+    """Seed numpy/random in each DataLoader worker"""
+    ws = torch.initial_seed() % (2 ** 32)
+    np.random.seed(ws)
+    random.seed(ws)
+
 # ========== Helper functions ==========
 
 def _batch_domain_str(batch: dict) -> str:
@@ -74,7 +94,7 @@ def make_masks(batch: dict, mode: str, max_len: int,
     coords_np = batch['coords'].numpy()
     pos_masks = np.zeros((B, max_len), dtype=bool)
 
-    rng = np.random.default_rng()
+    rng = _RNG # seeded by set_seed() when --seed is given, else a fresh RNG
     for b in range(B):
         traj_len = int(batch['traj_len'][b])
         pos_masks[b, :traj_len] = make_pos_mask(
@@ -619,7 +639,7 @@ def _match_sem_npys(
     return [Path(s) for s in sem_input]
 
 def build_loader(parquet_paths: list[Path], domain: str, sem_input: list[str] | None,
-                 cfg: ModelConfig, shuffle: bool) -> DataLoader:
+                 cfg: ModelConfig, shuffle: bool, seed: int | None = None) -> DataLoader:
     split = 'train' if shuffle else 'val'
     logger.info('Building %s %s loader from %d parquet(s)', domain, split, len(parquet_paths))
     sem_npy_paths = _match_sem_npys(parquet_paths, sem_input, domain=domain)
@@ -635,8 +655,7 @@ def build_loader(parquet_paths: list[Path], domain: str, sem_input: list[str] | 
     n_batches = (len(ds) + batch_size - 1) // batch_size
     logger.info('\t%s %s: %d trajectories -> %d batches/epoch (batch_size=%d)',
                 domain, split, len(ds), n_batches, batch_size)
-    return DataLoader(
-        ds,
+    loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
@@ -645,6 +664,11 @@ def build_loader(parquet_paths: list[Path], domain: str, sem_input: list[str] | 
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
+    if seed is not None:
+        loader_kwargs['worker_init_fn'] = _worker_init_fn
+        if shuffle:
+            loader_kwargs['generator'] = torch.Generator().manual_seed(seed)
+    return DataLoader(ds, **loader_kwargs)
 
 def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -654,6 +678,9 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+    if getattr(args, 'seed', None) is not None:
+        set_seed(args.seed)
 
     def _paths(p: str | None) -> list[Path]:
         if not p:
@@ -666,17 +693,18 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     if not (has_urban or has_maritime):
         raise ValueError('No training data: provide --urban-train and/or --maritime-train')
 
+    _seed = getattr(args, 'seed', None)
     urban_train_loader = build_loader(
-        _paths(args.urban_train), 'urban', args.urban_sem_npy or [], cfg, True
+        _paths(args.urban_train), 'urban', args.urban_sem_npy or [], cfg, True, seed=_seed
     ) if has_urban else None
     maritime_train_loader = build_loader(
-        _paths(args.maritime_train), 'maritime', args.maritime_sem_npy or [], cfg, True
+        _paths(args.maritime_train), 'maritime', args.maritime_sem_npy or [], cfg, True, seed=_seed
     ) if has_maritime else None
     urban_val_loader = build_loader(
-        _paths(args.urban_val), 'urban', args.urban_val_sem_npy or [], cfg, False
+        _paths(args.urban_val), 'urban', args.urban_val_sem_npy or [], cfg, False, seed=_seed
     ) if has_urban else None
     maritime_val_loader = build_loader(
-        _paths(args.maritime_val), 'maritime', args.maritime_val_sem_npy or [], cfg, False
+        _paths(args.maritime_val), 'maritime', args.maritime_val_sem_npy or [], cfg, False, seed=_seed
     ) if has_maritime else None
 
     class InterleavedLoader:
@@ -723,7 +751,7 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
         _ensure_hf_repo(hf_repo)
         logger.info('Best checkpoints will be backed up to hf://%s', hf_repo)
 
-    rng = np.random.default_rng()
+    rng = _RNG
 
     run_name = getattr(args, 'run_name', None)
     stage1_ckpt = f'{run_name}_stage1_best.pt' if run_name else 'stage1_best.pt'
@@ -813,9 +841,9 @@ def main():
     parser.add_argument('--maritime-sem-npy', nargs='*', default=None)
     parser.add_argument('--maritime-val-sem-npy', nargs='*', default=None)
 
-    parser.add_argument('--epochs', type=int, default=50)           # single-stage
-    parser.add_argument('--stage1-epochs', type=int, default=15)    # two-stage
-    parser.add_argument('--stage2-epochs', type=int, default=35)    # two-stage
+    parser.add_argument('--epochs', type=int, default=50) # single-stage
+    parser.add_argument('--stage1-epochs', type=int, default=0) # omitting contrastive pretraining
+    parser.add_argument('--stage2-epochs', type=int, default=35) # two-stage
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -824,8 +852,8 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--no-semantics', action='store_true')
     # Ablation knobs
-    parser.add_argument('--contrastive-lambda', type=float, default=0.1)  # 0 -> no contrastive regulari`er
-    parser.add_argument('--no-moe', action='store_true')                  # MoE -> standard FFN
+    parser.add_argument('--contrastive-lambda', type=float, default=0)  # 0 -> no contrastive regularizer
+    parser.add_argument('--no-moe', action='store_true') # MoE -> standard FFN
     parser.add_argument('--pos-encoding', default='rope', choices=['rope', 'sinusoidal'])
 
     parser.add_argument('--checkpoint-dir', default='checkpoints')
@@ -837,6 +865,7 @@ def main():
     parser.add_argument('--resume-stage1', type=int, default=0, metavar='N')
     parser.add_argument('--resume-stage2', type=int, default=0, metavar='N')
     parser.add_argument('--fresh-optim', action='store_true')
+    parser.add_argument('--seed', type=int, default=None)
     args = parser.parse_args()
 
     if args.resume_stage1 and args.resume_stage2:

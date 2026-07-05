@@ -405,11 +405,18 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         else:
             self.abs_pe = None
 
-        # Semantic cross-attention
+        # Semantic cross-attention (kept but currently NOT APPLIED; replaced by early fusion below)
         if cfg.use_semantics:
             self.g = SemanticCrossAttention(d, cfg.n_heads, cfg.sem_dim, cfg.dropout)
         else:
             self.g = None
+        # [early-fusion] semantics enter as an additive INPUT modality (like kinematics):
+        # project per-point e_sem (sem_dim -> d) and add it inside _embed, so semantics flow
+        # through every encoder layer instead of a droppable terminal residual
+        if cfg.use_semantics:
+            self.W_sem_in = nn.Linear(cfg.sem_dim, d)
+        else:
+            self.W_sem_in = None
         if cfg.no_sem_token:
             # [NO_SEM] token: replace semantic embedding when masked/unavailable
             # Masking scenario 1: no semantics available
@@ -446,7 +453,8 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # nn.init.zeros_(self.W_sem_pred.weight)
 
     def _embed(self, x_spatial: torch.Tensor, tau: torch.Tensor, kinematics: torch.Tensor,
-               domain_ids: torch.Tensor, pos_mask: torch.Tensor | None = None) -> torch.Tensor:
+               domain_ids: torch.Tensor, pos_mask: torch.Tensor | None = None,
+               e_sem: torch.Tensor | None = None) -> torch.Tensor:
         """
         Build per-point token embeddings
 
@@ -469,6 +477,19 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
 
         e_st = torch.cat([e_s, e_t], dim=-1)
         e = e_st + e_kin
+
+        # [early-fusion] add semantics as an input modality; masked positions get [NO_SEM] so a
+        # point's own context cannot leak its position; whole-modality drop passes e_sem=None
+        if self.W_sem_in is not None and (e_sem is not None or hasattr(self, 'no_sem')):
+            no_sem = (self.no_sem.view(1, 1, -1) if hasattr(self, 'no_sem')
+                      else e.new_zeros(1, 1, self.W_sem_in.in_features))
+            if e_sem is None:
+                e_sem_in = no_sem.expand(e.size(0), e.size(1), -1)
+            else:
+                e_sem_in = e_sem
+                if pos_mask is not None:
+                    e_sem_in = torch.where(pos_mask.unsqueeze(-1), no_sem.to(e_sem_in.dtype), e_sem_in)
+            e = e + self.W_sem_in(e_sem_in.to(e.dtype))
 
         e_dom = self.E_dom(domain_ids).unsqueeze(1)  # (B, 1, d)
         e = e + e_dom
@@ -509,14 +530,16 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
     ) -> torch.Tensor:
         B, L, _ = x_spatial.shape
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
-        e = self._embed(x_spatial, tau, kin, domain_ids)
+        # [early-fusion] semantics fused at the input (apply_g retained only for the shelved contrastive path)
+        e = self._embed(x_spatial, tau, kin, domain_ids, e_sem=e_sem)
         z, _ = self._run_layers(e, pad_mask)
 
-        if apply_g and self.g is not None:
-            if e_sem is None and hasattr(self, 'no_sem'):
-                e_sem = self.no_sem.view(1, 1, -1).expand(B, L, -1)
-            if e_sem is not None:
-                z = self.g(z, e_sem, pad_mask=pad_mask)
+        # [replaced by early fusion] old late semantic cross-attention:
+        # if apply_g and self.g is not None:
+        #     if e_sem is None and hasattr(self, 'no_sem'):
+        #         e_sem = self.no_sem.view(1, 1, -1).expand(B, L, -1)
+        #     if e_sem is not None:
+        #         z = self.g(z, e_sem, pad_mask=pad_mask)
 
         return z
     
@@ -554,41 +577,37 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         """
         B, L = x_spatial.shape[:2]
 
-        # Resolve semantic input for g
-        if sem_group_masked or e_sem is None:
-            if hasattr(self, 'no_sem'):
-                e_sem_use = self.no_sem.view(1, 1, -1).expand(B, L, -1)
-            else:
-                e_sem_use = None
-        else:
-            e_sem_use = e_sem
-            # Mask semantics depending on pos_mask
-            if pos_mask is not None and hasattr(self, 'no_sem'):
-                no_sem_tok = self.no_sem.view(1, 1, -1).expand(B, L, -1)
-                e_sem_use = torch.where(pos_mask.unsqueeze(-1), no_sem_tok, e_sem_use)
+        # [replaced by early fusion] old semantic input resolution for the late cross-attention g:
+        # if sem_group_masked or e_sem is None:
+        #     if hasattr(self, 'no_sem'):
+        #         e_sem_use = self.no_sem.view(1, 1, -1).expand(B, L, -1)
+        #     else:
+        #         e_sem_use = None
+        # else:
+        #     e_sem_use = e_sem
+        #     if pos_mask is not None and hasattr(self, 'no_sem'):
+        #         no_sem_tok = self.no_sem.view(1, 1, -1).expand(B, L, -1)
+        #         e_sem_use = torch.where(pos_mask.unsqueeze(-1), no_sem_tok, e_sem_use)
 
-        # Full forward (handles spatial masking, kin_unk, g cross-attention)
+        # [early-fusion] semantics enter at the input; sem_group_masked drops the whole modality
+        e_sem_fused = None if sem_group_masked else e_sem
 
         # Target: [d_lat, d_lon, d_t_norm, speed_n, heading_n, turn_n]
         target = torch.cat([x_spatial, tau[..., 3:4], kinematics], dim=-1)
         # Mask kinematic group if needed
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
-        # Content masking happens INSIDE _embed: at masked positions the spatial
-        # half -> [MASK_SPATIAL] and kinematics -> 0, but the temporal embedding
-        # Fourier(tau) is kept as the per-point localization anchor
-        # Spatial content at masked positions is replaced by [MASK_SPATIAL] inside _embed
-        # RoPE is sequence-index (in the attention layers), so coords are not used for
-        # positional encoding -> no spatial leakage and no need for a [MASK_COORD] token
-        e = self._embed(x_spatial, tau, kin, domain_ids, pos_mask=pos_mask)
+        # Content masking happens INSIDE _embed: masked spatial -> [MASK_SPATIAL], kin -> 0,
+        # masked-point semantics -> [NO_SEM]; temporal Fourier(tau) kept as the localization anchor
+        # RoPE is sequence-index, so coords are not used for positional encoding (no spatial leakage)
+        e = self._embed(x_spatial, tau, kin, domain_ids, pos_mask=pos_mask, e_sem=e_sem_fused)
         z, lb_loss = self._run_layers(e, pad_mask)
 
-        if self.g is not None:
-            if e_sem_use is not None:
-                h = self.g(z, e_sem_use, pad_mask=pad_mask)
-            else:
-                h = z
-        else:
-            h = z
+        # [replaced by early fusion] old late semantic cross-attention:
+        # if self.g is not None:
+        #     h = self.g(z, e_sem_use, pad_mask=pad_mask) if e_sem_use is not None else z
+        # else:
+        #     h = z
+        h = z
 
         pred = self.output_head(h)
 
