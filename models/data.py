@@ -179,7 +179,11 @@ class TrajectoryDataset(Dataset):
 
         # x = [d_lat, d_lon, d_t] (+ kinematics if input_dim == 6)
         x = np.concatenate([coords, tau[:, 3:4]], axis=1)
-        if self.input_dim == 6 and kin is not None:
+        if self.input_dim == 6:
+            # Zero-fill kinematics when the source has none (urban; or maritime
+            # without SOG/COG) so every x has the same width and the batch collates.
+            if kin is None:
+                kin = np.zeros((len(x), 3), dtype=np.float32)
             x = np.concatenate([x, kin], axis=1)
 
         # DMR: subsample if longer than max_len
@@ -223,12 +227,17 @@ class TrajectoryDataset(Dataset):
 
     @staticmethod
     def _kinematics_raw(df: pd.DataFrame) -> np.ndarray | None:
-        """Vectorized kinematics over a whole dataframe; called once at load."""
-        if not all(c in df.columns for c in ('SOG', 'COG', 'ROT')):
+        """Vectorized kinematics over a whole dataframe; called once at load.
+
+        Requires SOG and COG; ROT is optional and zero-filled when absent (e.g.
+        Piraeus reports speed/course but no rate of turn), so a source with real
+        speed/course is not discarded for lacking ROT."""
+        if not all(c in df.columns for c in ('SOG', 'COG')):
             return None
         sog = np.nan_to_num(df['SOG'].values.astype(np.float32), nan=0.0)
         cog = np.nan_to_num(df['COG'].values.astype(np.float32), nan=0.0)
-        rot = np.nan_to_num(df['ROT'].values.astype(np.float32), nan=0.0)
+        rot = (np.nan_to_num(df['ROT'].values.astype(np.float32), nan=0.0)
+               if 'ROT' in df.columns else np.zeros(len(df), dtype=np.float32))
         speed_n = np.clip(sog / 30.0, 0.0, 1.0)
         heading_n = np.clip(cog / 180.0 - 1.0, -1.0, 1.0)
         turn_n = np.clip(rot / 720.0, -1.0, 1.0)
