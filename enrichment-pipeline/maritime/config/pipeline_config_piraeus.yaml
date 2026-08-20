@@ -1,0 +1,84 @@
+# Piraeus (unipi / University of Piraeus, Saronic Gulf) AIS pipeline config.
+# Mirrors pipeline_config.yaml (DMA), differing in:
+#   - parquet input with a hashed vessel_id -> surrogate integer MMSI (source: piraeus)
+#   - millisecond epoch timestamps (ts_unit: ms)
+#   - ship type joined from a separate static file (static_csv)
+#   - no mobile-type column to filter on
+#   - region context layers re-sourced for Greek waters -> data/context_piraeus/
+#   - global layers (EEZ, IHO seas, Copernicus) reused unchanged -> data/context/
+# Run run_select_days.py first to extract the chosen days from the monthly parquet
+# URLs:
+#   = https://www.sciencedirect.com/science/article/pii/S2352340921010568
+#   - https://zenodo.org/records/6323416
+archimedes:
+  annotation_binary: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/src/annotate
+  python_src: /home/ubuntu/thesis/Archimedes-new/AIS-semantic-trajectories/src
+  params_json: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/test/settings/params.json
+
+ingest:
+  source: piraeus
+  ts_unit: ms
+  mobile_type_filter: null
+  static_csv: /home/ubuntu/thesis/data/ais/piraeus/ais_static/ais_static/unipi_ais_static.csv
+  forward_fill_cols:
+    - Ship type
+  raw_columns:
+    mmsi:        MMSI
+    timestamp:   timestamp # run_select_days normalizes 't'/'timestamp' -> 'timestamp'
+    lat:         lat
+    lon:         lon
+    sog:         SOG
+    cog:         COG
+    heading:     Heading
+    ship_type:   Ship type
+
+annotate:
+  annotated_only: false
+  id_col: 1
+  ts_col: 4
+
+segment:
+  source: piraeus
+  min_gap_size: 3600
+  min_points: 20
+  min_duration_s: 300          # 5 minutes
+  min_displacement_nm: 0.5     # 0.5 nautical miles
+
+enrich:
+  stop_speed_kn: 0.5
+  slow_speed_kn: 3.0
+
+  context:
+    # Region-specific layers, sourced for the Saronic Gulf -> data/context_piraeus/
+    ports_csv: data/context_piraeus/ports.csv
+    protected_areas_shp: data/context_piraeus/osm_protected_areas.shp
+    separation_zones_shp: data/context_piraeus/osm_separation.shp
+    harbour_polygons_shp: data/context_piraeus/osm_harbours.shp
+    # Dedicated territorial-sea polygon (makes in_territorial_sea meaningful;
+    # the global EEZ file has 200 NM polygons only). Saronic layer from the dataset.
+    territorial_waters_shp: data/context_piraeus/territorial_waters.shp
+    # placemarks_shp / capes_shp omitted: loaded but unused by SpatialEnricher
+    # Global layers reused unchanged -> data/context/
+    eez_gpkg: data/context/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg
+    sea_areas_shp: data/context/World_Seas_IHO_v3/World_Seas_IHO_v3.shp
+    # Aegean GEBCO tile (regional, kept separate from the Denmark tile)
+    gebco_nc_dir: data/context_piraeus/gebco/
+
+  port_proximity:
+    berthed_nm: 0.5      # within 0.5 NM + inside harbour polygon -> berthed
+    approach_nm: 5.0     # within 5 NM of WPI centroid -> port_approach
+    coastal_nm: 20.0     # within 20 NM -> coastal; beyond -> offshore
+
+  # Ocean enrichment via copernicusmarine (global datasets, cover the Mediterranean)
+  ocean:
+    wave_dataset: cmems_mod_glo_wav_my_0.2deg_PT3H-i
+    wave_variable: VHM0
+    current_dataset: cmems_mod_glo_phy_my_0.083deg_P1D-m
+    current_variables: [uo, vo]
+    cache_dir: data/ocean_cache/
+    batch_days: 7
+    bbox_buffer_deg: 1.0
+
+canonicalize:
+  # Resample to one point per interval using floor-bucket selection
+  interval_s: 60 # 1 minute

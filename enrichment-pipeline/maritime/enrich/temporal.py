@@ -42,6 +42,7 @@ _ISO_TO_TZ: dict[str, str] = {
     'FRA': 'Europe/Paris',
     'ESP': 'Europe/Madrid',
     'PRT': 'Europe/Lisbon',
+    'GRC': 'Europe/Athens',
     'RUS': 'Europe/Moscow',
     'USA': 'America/New_York',
     'CAN': 'America/Halifax',

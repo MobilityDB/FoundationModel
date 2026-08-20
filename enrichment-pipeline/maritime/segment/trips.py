@@ -140,6 +140,7 @@ def run(joined_parquet: Path | str, output_dir: Path | str,
     min_pts = int(seg_cfg.get('min_points', 20))
     min_dur = float(seg_cfg.get('min_duration_s', 300))
     min_disp = float(seg_cfg.get('min_displacement_nm', 0.5))
+    source = str(seg_cfg.get('source', _SOURCE))
 
     logger.info('Loading joined .parquet: %s', joined_parquet)
     df = pd.read_parquet(joined_parquet)
@@ -156,7 +157,7 @@ def run(joined_parquet: Path | str, output_dir: Path | str,
 
     # ========== Build trajectory_id ==========
     df['trajectory_id'] = (
-        'aisdk_'
+        source + '_'
         + df['mmsi'].astype(str) + '_'
         + df['_trip_idx'].astype(str).str.zfill(4)
     )
@@ -165,7 +166,7 @@ def run(joined_parquet: Path | str, output_dir: Path | str,
     if keep_all:
         df_all = df.copy()
         df_all['point_idx'] = df_all.groupby('trajectory_id').cumcount()
-        df_all['source'] = _SOURCE
+        df_all['source'] = source
         type_col_all = 'Ship type' if 'Ship type' in df_all.columns else None
         if type_col_all:
             df_all['transport_mode'] = df_all[type_col_all].apply(_ship_type_to_mode)
@@ -197,7 +198,7 @@ def run(joined_parquet: Path | str, output_dir: Path | str,
 
     # ========== Add canonical fields ==========
     df['point_idx'] = df.groupby('trajectory_id').cumcount()
-    df['source'] = _SOURCE
+    df['source'] = source
     type_col = 'Ship type' if 'Ship type' in df.columns else None
     if type_col:
         df['transport_mode'] = df[type_col].apply(_ship_type_to_mode)

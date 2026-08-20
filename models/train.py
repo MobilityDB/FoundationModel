@@ -854,6 +854,7 @@ def main():
     # Ablation knobs
     parser.add_argument('--contrastive-lambda', type=float, default=0)  # 0 -> no contrastive regularizer
     parser.add_argument('--no-moe', action='store_true') # MoE -> standard FFN
+    parser.add_argument('--ffn-dim', type=int, default=512) # FFN hidden dim for --no-moe (1024=compute-, 2048=param-matched to MoE at d=128)
     parser.add_argument('--pos-encoding', default='rope', choices=['rope', 'sinusoidal'])
 
     parser.add_argument('--checkpoint-dir', default='checkpoints')
@@ -882,6 +883,7 @@ def main():
         use_semantics=not args.no_semantics,
         contrastive_lambda=args.contrastive_lambda,
         use_moe=not args.no_moe,
+        ffn_dim=args.ffn_dim,
         pos_encoding=args.pos_encoding,
         checkpoint_dir=args.checkpoint_dir,
         stage1_epochs=args.stage1_epochs,

@@ -50,6 +50,10 @@ class SpatialEnricher:
         self._harbor_gdf = self._load_shp(context_cfg.get('harbour_polygons_shp'))
         self._eez_gdf = self._load_gpkg(context_cfg.get('eez_gpkg'))
         self._sea_areas_gdf = self._load_shp(context_cfg.get('sea_areas_shp'))
+        # Optional dedicated 12 NM territorial-sea polygon layer. The global EEZ
+        # file carries only 200 NM polygons, so without this in_territorial_sea
+        # is always False; supply a regional layer to make the flag meaningful.
+        self._terr_sea_gdf = self._load_shp(context_cfg.get('territorial_waters_shp'))
 
         import spatial_context as sc
         self._sc = sc
@@ -241,6 +245,19 @@ class SpatialEnricher:
                 logger.warning('\t\tEEZ sjoin failed: %s', exc)
         else:
             logger.warning('\t\tEEZ gdf is not available')
+
+        # ========== Territorial sea (dedicated polygon layer) ==========
+        # When a territorial-waters layer is supplied it is authoritative, the
+        # EEZ POL_TYPE check above cannot set this (200 NM polygons only), so a
+        # point-in-polygon test against the dedicated layer overrides it
+        if self._terr_sea_gdf is not None:
+            logger.info('\tSpatial enriching: territorial sea')
+            try:
+                joined = _sjoin_within(self._terr_sea_gdf[['geometry']])
+                hit_pos = joined.dropna(subset=['index_right'])['_pos'].values
+                in_terr_sea[hit_pos.astype(int)] = True
+            except Exception as exc:
+                logger.warning('\t\tTerritorial-sea sjoin failed: %s', exc)
 
         # ========== Assign results ==========
         df['nearest_port_nm'] = nearest_port_nm

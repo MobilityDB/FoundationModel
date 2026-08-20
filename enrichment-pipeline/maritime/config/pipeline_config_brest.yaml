@@ -1,0 +1,89 @@
+# Brest (NARI / Naval Academy, Bay of Biscay & Celtic Sea) AIS pipeline config.
+# Mirrors pipeline_config.yaml (DMA), differing in:
+#   - parquet input with a real MMSI (source: brest)
+#   - numeric navigational status mapped to text (shared US/NARI code table)
+#   - ship type / draught / name / destination joined from nari_static
+#   - integer epoch-second timestamps; no mobile-type column to filter on
+#   - region context layers sourced for French Atlantic waters -> data/context_brest/
+#   - global layers (EEZ, IHO seas, 12 NM territorial seas, Copernicus) -> data/context/
+# Run run_select_days_brest.py first to extract the chosen days from the 6-month file
+# Annotation (Archimedes) is region-agnostic and reuses the same binary + params.json
+# URLs:
+#   - https://www.sciencedirect.com/science/article/pii/S2352340919304950
+#   - https://zenodo.org/records/1167595
+archimedes:
+  annotation_binary: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/src/annotate
+  python_src: /home/ubuntu/thesis/Archimedes-new/AIS-semantic-trajectories/src
+  params_json: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/test/settings/params.json
+
+ingest:
+  source: brest
+  mobile_type_filter: null # no Type-of-mobile column in the NARI data
+  static_csv: /home/ubuntu/thesis/data/ais/brest/ais-data/nari_static.parquet
+  forward_fill_cols:
+    - Ship type
+    - Name
+    - Draught
+    - Destination
+  raw_columns:
+    # Canonical (post-rename) names; the brest handler reads the NARI source
+    # columns (sourcemmsi, speedoverground, ...) and aliases them to these
+    mmsi:        MMSI
+    timestamp:   timestamp  # run_select_days normalizes the NARI 't' -> 'timestamp' (epoch seconds)
+    lat:         lat
+    lon:         lon
+    sog:         SOG
+    cog:         COG
+    heading:     Heading
+    rot:         ROT
+    nav_status:  Navigational status
+    ship_type:   Ship type
+
+annotate:
+  annotated_only: false
+  id_col: 1
+  ts_col: 4
+
+segment:
+  source: brest
+  min_gap_size: 3600
+  min_points: 20
+  min_duration_s: 300          # 5 minutes
+  min_displacement_nm: 0.5     # 0.5 nautical miles
+
+enrich:
+  stop_speed_kn: 0.5
+  slow_speed_kn: 3.0
+
+  context:
+    # Region-specific layers, sourced for the box (W -10.1, S 44.9, E 0.1, N 51.1)
+    ports_csv: data/context_brest/ports.csv
+    protected_areas_shp: data/context_brest/osm_protected_areas.shp
+    separation_zones_shp: data/context_brest/osm_separation.shp
+    harbour_polygons_shp: data/context_brest/osm_harbours.shp
+    # placemarks_shp / capes_shp omitted: loaded but unused by SpatialEnricher
+    # Global layers reused unchanged -> data/context/
+    territorial_waters_shp: data/context/World_12NM_v4_20231025/eez_12nm_v4.shp
+    eez_gpkg: data/context/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg
+    sea_areas_shp: data/context/World_Seas_IHO_v3/World_Seas_IHO_v3.shp
+    # Bay-of-Biscay / Celtic-Sea GEBCO tile (regional)
+    gebco_nc_dir: data/context_brest/gebco/
+
+  port_proximity:
+    berthed_nm: 0.5      # within 0.5 NM + inside harbour polygon -> berthed
+    approach_nm: 5.0     # within 5 NM of WPI centroid -> port_approach
+    coastal_nm: 20.0     # within 20 NM -> coastal; beyond -> offshore
+
+  # Ocean enrichment via copernicusmarine (global datasets, cover the region)
+  ocean:
+    wave_dataset: cmems_mod_glo_wav_my_0.2deg_PT3H-i
+    wave_variable: VHM0
+    current_dataset: cmems_mod_glo_phy_my_0.083deg_P1D-m
+    current_variables: [uo, vo]
+    cache_dir: data/ocean_cache/
+    batch_days: 7
+    bbox_buffer_deg: 1.0
+
+canonicalize:
+  # Resample to one point per interval using floor-bucket selection
+  interval_s: 60 # 1 minute
